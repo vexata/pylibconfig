@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 # Author: Riccardo Gori <goriccardo@gmail.com>
 # License: GPL-3 http://www.gnu.org/licenses/gpl.txt
+# Copyright 2014-2018 Sandeep Kasargod <sandeep@vexata.com>
+
+# ---------------------------------------------------------------------------------------
+# Dependencies: 
+#  Requires libconfig RPM to be installed on host (v 1.4.9+)
+# ---------------------------------------------------------------------------------------
 
 from ctypes import c_long, c_longlong, c_double, c_short, c_int, POINTER, \
                    byref, CDLL, c_void_p, c_char_p, Structure, Union, \
-                   CFUNCTYPE, c_uint
+                   CFUNCTYPE, c_uint, c_ushort
 
 class config_list_t(Structure): pass
 class config_setting_t(Structure): pass
@@ -18,53 +24,44 @@ class config_value_t(Union):
                 ('list', POINTER(config_list_t))]
 
 config_setting_t._fields_ = [('name', c_char_p),
-                            ('type', c_short),
-                            ('format', c_short),
-                            ('value', config_value_t),
-                            ('parent', POINTER(config_setting_t)),
-                            ('config', POINTER(config_t)),
-                            ('hook', c_void_p),
-                            ('line', c_uint)]
-
-class py_config_setting(object):
-    def __init__(self, config_setting, pyparent):
-        self._cfg_set = config_setting
-        self._pyparent = pyparent
-
-    def __str__(self):
-        parent = self._cfg_set
-        name = parent.contents.name
-        parent = parent.contents.parent
-        pname = parent.contents.name
-        while pname:
-            name = pname + '.' + name
-            parent = parent.contents.parent
-            pname = parent.contents.name
-        return name
-
-    __repr__ = __str__
-
-    def __getattr__(self, name):
-        parent = self._cfg_set
-        pname = parent.contents.name
-        while pname:
-            name = pname + '.' + name
-            parent = parent.contents.parent
-            pname = parent.contents.name
-        return self._pyparent.__getattr__(name)
+                             ('type', c_short),
+                             ('format', c_short),
+                             ('value', config_value_t),
+                             ('parent', POINTER(config_setting_t)),
+                             ('config', POINTER(config_t)),
+                             ('hook', c_void_p),
+                             ('line', c_uint),
+                             ('file', c_char_p)
+                         ]
 
 config_list_t._fields_ = [('length', c_uint),
-                          ('capacity', c_uint),
                           ('elements', POINTER(POINTER(config_setting_t)))]
 
 config_t._fields_ = [('root', POINTER(config_setting_t)),
                      ('destructor', POINTER(CFUNCTYPE(None, c_void_p))),
-                     ('flags', c_int),
+                     ('flags', c_ushort),
+                     ('tab_width', c_ushort),
+                     ('default_format', c_short),
+                     ('include_dir', c_char_p),
                      ('error_text', c_char_p),
-                     ('error_line', c_int)]
+                     ('error_file', c_char_p),
+                     ('error_line', c_int),
+                     ('error_type', c_int),
+                     ('filenames', POINTER(c_char_p)),
+                     ('num_filenames', c_uint)
+                 ]
 
 class group(type): pass
 class array(list): pass
+
+class AttributeDict(dict):
+    """A dictionary where the keys can be accessed using
+    attribute access form, viz dict.attribute in addition
+    to the usual dict['attribute'] way.
+    """
+    def __init__(self, **kwargs):
+        dict.__init__(self, **kwargs)
+        self.__dict__ = self
 
 class libconfigFile(object):
     #Defines
@@ -89,13 +86,13 @@ class libconfigFile(object):
                  CONFIG_TYPE_BOOL:bool,
                  CONFIG_TYPE_ARRAY:array,
                  CONFIG_TYPE_LIST:list}
-    def __init__(self, filename=None, new=False):
+    def __init__(self, filename=None, new=False, include_dir=None):
         """Warning! If new is True the file will be overwritten"""
         self._config = config_t()
         self._load_library()
         self._config_init(byref(self._config))
         if filename and not new:
-            self.open(filename)
+            self.open(filename, include_dir)
         self._openfile = filename
 
     def _load_library(self):
@@ -104,12 +101,14 @@ class libconfigFile(object):
         self._config_init = libconfig.config_init
         #Destroy
         self._config_destroy = libconfig.config_destroy
+        #Include dirs
+        self._config_set_include_dir = libconfig.config_set_include_dir
         #Read
         self._config_read_file = libconfig.config_read_file
         self._config_read = libconfig.config_read
         #Write
         self._config_write_file = libconfig.config_write_file
-        #Get array element
+        #Get list/array/group element
         self._config_setting_get_elem = libconfig.config_setting_get_elem
         self._config_setting_get_elem.restype = POINTER(config_setting_t)
         self._config_setting_length = libconfig.config_setting_length
@@ -149,20 +148,18 @@ class libconfigFile(object):
         self._config_setting_add.argtypes = [POINTER(config_setting_t),
                                              c_char_p, c_int]
 
-    def _arr2list(self, conf, name):
-        ret = []
-        ln = self._config_setting_length(byref(conf), name)
-        for i in range(ln):
-            ret.append(self._config_setting_get_elem(conf, name))
-        return ret
-
     def _get_value(self, cfg_set_t_p):
         """Return the value of the config_setting_t"""
         if not bool(cfg_set_t_p):
             return None
         partype = cfg_set_t_p.contents.type
         if partype == self.CONFIG_TYPE_GROUP:
-            return py_config_setting(cfg_set_t_p, self)
+            ret = AttributeDict()
+            ln = self._config_setting_length(cfg_set_t_p)
+            for i in xrange(ln):
+                el = self._config_setting_get_elem(cfg_set_t_p, c_int(i))
+                ret[el.contents.name] = self._get_value(el)
+            return ret
         if partype == self.CONFIG_TYPE_INT:
             return int(self._config_setting_get_int(cfg_set_t_p))
         if partype == self.CONFIG_TYPE_INT64:
@@ -174,7 +171,6 @@ class libconfigFile(object):
         if partype == self.CONFIG_TYPE_BOOL:
             return bool(self._config_setting_get_bool(cfg_set_t_p))
         if partype in (self.CONFIG_TYPE_LIST,self.CONFIG_TYPE_ARRAY):
-            #Is a list or an array
             ret = []
             ln = self._config_setting_length(cfg_set_t_p)
             for i in xrange(ln):
@@ -241,7 +237,7 @@ class libconfigFile(object):
     def __getattr__(self, name):
         ret = self.get(name)
         if ret == None:
-            raise AttributeError('This configfile has not attribute %s' % name)
+            raise AttributeError('This configfile has no attribute "%s"' % name)
         return ret
 
     def get(self, name, default=None):
@@ -311,8 +307,10 @@ class libconfigFile(object):
         if filename == None: filename = self._openfile
         self._config_write_file(byref(self._config), filename)
 
-    def open(self, filename):
+    def open(self, filename, include_dir=None):
         """Open an existing config file"""
+        if include_dir:
+            self._config_set_include_dir(byref(self._config), include_dir)
         if self._config_read_file(byref(self._config), filename) == self.CONFIG_TRUE:
             self._openfile = filename
         else:
